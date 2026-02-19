@@ -8,9 +8,6 @@ from PIL import Image
 import pandas as pd
 
 # PDF generation (ReportLab)
-from reportlab.pdfgen import canvas
-from reportlab.lib.units import cm
-from reportlab.lib.utils import ImageReader
 
 # --------------------------
 # Configuration & Constants
@@ -500,3 +497,4 @@ with st.container():
 # Footer
 
 st.markdown("<div class='muted'>Tip: change the default admin password and consider using st.secrets for salts and configurations.</div>", unsafe_allow_html=True)
+
