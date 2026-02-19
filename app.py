@@ -8,7 +8,6 @@ from PIL import Image
 import pandas as pd
 
 # PDF generation (ReportLab)
-from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
 from reportlab.lib.units import cm
 from reportlab.lib.utils import ImageReader
@@ -499,4 +498,5 @@ with st.container():
     st.markdown("</div>", unsafe_allow_html=True)
 
 # Footer
+
 st.markdown("<div class='muted'>Tip: change the default admin password and consider using st.secrets for salts and configurations.</div>", unsafe_allow_html=True)
