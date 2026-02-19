@@ -6,47 +6,51 @@ import hashlib
 from io import BytesIO
 from PIL import Image
 import pandas as pd
+from fpdf import FPDF
 
-# PDF generation (ReportLab)
-from reportlab.lib.pagesizes import A4
-from reportlab.pdfgen import canvas
-from reportlab.lib.units import cm
-from reportlab.lib.utils import ImageReader
-# --------------------------
-# Configuration & Constants
-# --------------------------
+
+# --------------------------------------------------
+# CONFIG
+# --------------------------------------------------
 DB_NAME = "employee_data.db"
 IMAGE_DIR = "citizenship_images"
-
-# Use a salt from secrets if available (recommended); otherwise a static fallback
 PASSWORD_SALT = st.secrets.get("PASSWORD_SALT", "Sanjay#$55")
 
 st.set_page_config(page_title="Employee Registration (Secured)", page_icon="🛡️", layout="wide")
 
-# --------------------------
-# Utilities
-# --------------------------
+
+# --------------------------------------------------
+# HELPERS
+# --------------------------------------------------
+def _s(text: str) -> str:
+    """Sanitize text for FPDF (latin-1 only)."""
+    if text is None:
+        return ""
+    return str(text).encode("latin-1", "ignore").decode("latin-1")
+
+
 def hash_password(password: str) -> str:
     salted = (PASSWORD_SALT + password).encode("utf-8")
     return hashlib.sha256(salted).hexdigest()
 
+
 def _column_exists(conn, table: str, col: str) -> bool:
     cur = conn.cursor()
     cur.execute(f"PRAGMA table_info({table})")
-    cols = [r[1] for r in cur.fetchall()]
-    return col in cols
+    return col in [r[1] for r in cur.fetchall()]
+
 
 def _add_column_if_missing(conn, table: str, col_def: str):
     col_name = col_def.split()[0]
     if not _column_exists(conn, table, col_name):
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {col_def}")
 
+
 def init_db():
     os.makedirs(IMAGE_DIR, exist_ok=True)
     conn = sqlite3.connect(DB_NAME)
     cur = conn.cursor()
 
-    # Employees table (base definition)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS employees (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -54,15 +58,14 @@ def init_db():
             employee_name TEXT,
             address TEXT,
             phone TEXT,
-            image_path TEXT,             -- legacy single image (kept for backward compatibility)
+            image_path TEXT,
             created_at TEXT
         )
     """)
-    # --- Auto-migrate: add new columns if missing ---
+
     _add_column_if_missing(conn, "employees", "image_front_path TEXT")
     _add_column_if_missing(conn, "employees", "image_back_path TEXT")
 
-    # Users table
     cur.execute("""
         CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -73,45 +76,48 @@ def init_db():
         )
     """)
 
-    # Seed default admin if not exists
-    cur.execute("SELECT COUNT(1) FROM users WHERE username = ?", ("admin",))
+    cur.execute("SELECT COUNT(*) FROM users WHERE username='admin'")
     if cur.fetchone()[0] == 0:
         cur.execute("""
             INSERT INTO users (username, full_name, password_hash, role)
             VALUES (?, ?, ?, ?)
         """, ("admin", "Administrator", hash_password("admin123"), "admin"))
+
     conn.commit()
     conn.close()
 
+
 def authenticate(username: str, password: str):
-    """Return (True, user_dict) if auth ok else (False, None)"""
     conn = sqlite3.connect(DB_NAME)
     cur = conn.cursor()
-    cur.execute("SELECT id, username, full_name, password_hash, role FROM users WHERE username = ?", (username,))
+    cur.execute("SELECT id, username, full_name, password_hash, role FROM users WHERE username=?", (username,))
     row = cur.fetchone()
     conn.close()
+
     if not row:
         return False, None
+
     uid, uname, fname, pw_hash, role = row
     if hash_password(password) == pw_hash:
         return True, {"id": uid, "username": uname, "full_name": fname, "role": role}
+
     return False, None
 
+
 def _save_image(file, base_name: str) -> str:
-    ext = os.path.splitext(file.name)[1].lower() or ".png"
-    safe_base = base_name.replace("/", "_").replace("\\", "_").replace(" ", "_")
-    path = os.path.join(IMAGE_DIR, f"{safe_base}{ext}")
+    ext = os.path.splitext(file.name)[1].lower()
+    safe_name = base_name.replace(" ", "_").replace("/", "_")
+    path = os.path.join(IMAGE_DIR, f"{safe_name}{ext}")
+
     with open(path, "wb") as f:
         f.write(file.getbuffer())
+
     return path
 
-def save_employee(citizenship_no, name, addr, phone, image_front_file, image_back_file):
-    # persist both images
-    front_path = _save_image(image_front_file, f"{citizenship_no}_front")
-    back_path  = _save_image(image_back_file,  f"{citizenship_no}_back")
 
-    # For backward compatibility, keep image_path equal to front
-    legacy_path = front_path
+def save_employee(cit, name, addr, phone, front_img, back_img):
+    front_path = _save_image(front_img, f"{cit}_front")
+    back_path = _save_image(back_img, f"{cit}_back")
 
     conn = sqlite3.connect(DB_NAME)
     cur = conn.cursor()
@@ -119,386 +125,319 @@ def save_employee(citizenship_no, name, addr, phone, image_front_file, image_bac
         INSERT OR REPLACE INTO employees
         (citizenship_no, employee_name, address, phone, image_path, image_front_path, image_back_path, created_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    """, (citizenship_no, name, addr, phone, legacy_path, front_path, back_path, datetime.now().isoformat(timespec="seconds")))
+    """, (
+        cit, name, addr, phone,
+        front_path,
+        front_path,
+        back_path,
+        datetime.now().isoformat(timespec="seconds")
+    ))
     conn.commit()
     conn.close()
-
     return front_path, back_path
+
 
 def fetch_employees():
     conn = sqlite3.connect(DB_NAME)
     cur = conn.cursor()
     cur.execute("""
-        SELECT id, citizenship_no, employee_name, address, phone,
-               image_front_path, image_back_path, created_at
-        FROM employees
-        ORDER BY created_at DESC
+        SELECT id, citizenship_no, employee_name, address, phone, image_front_path, image_back_path, created_at
+        FROM employees ORDER BY created_at DESC
     """)
     rows = cur.fetchall()
     conn.close()
-    cols = ["id", "citizenship_no", "employee_name", "address", "phone", "image_front_path", "image_back_path", "created_at"]
-    df = pd.DataFrame(rows, columns=cols)
-    return df
+
+    return pd.DataFrame(rows, columns=[
+        "id", "citizenship_no", "employee_name", "address",
+        "phone", "image_front_path", "image_back_path", "created_at"
+    ])
+
 
 def to_csv_bytes(df: pd.DataFrame) -> bytes:
-    # include front/back image paths in CSV; drop internal id
-    return df.drop(columns=["id"], errors="ignore").to_csv(index=False).encode("utf-8")
+    return df.drop(columns=["id"]).to_csv(index=False).encode("utf-8")
 
-# ---------- PDF creators ----------
-def _draw_wrapped_text(c: canvas.Canvas, text: str, x: float, y: float, max_width: float, line_height: float = 14):
-    """Simple text wrapper for PDF drawing."""
-    if not text:
-        return y
-    words = text.split()
-    line = ""
-    while words:
-        probe = line + ("" if line == "" else " ") + words[0]
-        if c.stringWidth(probe) <= max_width:
-            line = probe
-            words.pop(0)
-        else:
-            c.drawString(x, y, line)
-            y -= line_height
-            line = ""
-    if line:
-        c.drawString(x, y, line)
-        y -= line_height
-    return y
 
-def _draw_thumbnail(c, img_path, x, y, max_w_cm=8, max_h_cm=5):
-    if not img_path or not os.path.exists(img_path):
-        return y
-    try:
-        img = Image.open(img_path)
-        max_w = max_w_cm * cm
-        max_h = max_h_cm * cm
-        img.thumbnail((int(max_w), int(max_h)))
-        img_reader = ImageReader(img)
-        w, h = img.size
-        c.drawImage(img_reader, x, y - h, w, h, mask='auto')
-        return y - h - 6  # small gap after
-    except Exception:
-        return y
-
+# --------------------------------------------------
+# FPDF PDF Builders
+# --------------------------------------------------
 def pdf_all_records(df: pd.DataFrame) -> bytes:
-    buffer = BytesIO()
-    c = canvas.Canvas(buffer, pagesize=A4)
-    width, height = A4
+    pdf = FPDF("P", "mm", "A4")
+    pdf.set_auto_page_break(True, margin=15)
+    pdf.add_page()
 
-    margin = 2*cm
-    text_x = margin
-    y = height - margin
+    pdf.set_font("Helvetica", "B", 16)
+    pdf.cell(0, 10, _s("Employee Records Report"), ln=1)
 
-    c.setTitle("Employee Records Report")
+    pdf.set_font("Helvetica", "", 10)
+    pdf.cell(0, 6, _s(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"), ln=1)
+    pdf.ln(4)
 
-    # Title
-    c.setFont("Helvetica-Bold", 16)
-    c.drawString(text_x, y, "Employee Records Report")
-    c.setFont("Helvetica", 10)
-    y -= 18
-    c.drawString(text_x, y, f"Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    y -= 14
-    c.line(margin, y, width - margin, y)
-    y -= 16
-
-    c.setFont("Helvetica", 11)
     for _, row in df.iterrows():
-        # New page if needed
-        if y < margin + 7*cm:
-            c.showPage()
-            y = height - margin
-            c.setFont("Helvetica", 11)
+        pdf.set_font("Helvetica", "B", 12)
+        title = f"{row['employee_name']} (Citizenship: {row['citizenship_no']})"
+        pdf.multi_cell(0, 7, _s(title))
 
-        c.setFont("Helvetica-Bold", 12)
-        c.drawString(text_x, y, f"{row['employee_name']}  (Citizenship: {row['citizenship_no']})")
-        y -= 14
-        c.setFont("Helvetica", 11)
-        y = _draw_wrapped_text(c, f"Address: {row['address']}", text_x, y, max_width=width - 2*margin)
-        c.drawString(text_x, y, f"Phone: {row['phone']}")
-        y -= 14
-        c.drawString(text_x, y, f"Created At: {row['created_at']}")
-        y -= 12
+        pdf.set_font("Helvetica", "", 11)
+        pdf.multi_cell(0, 6, _s(f"Address: {row['address']}"))
+        pdf.cell(0, 6, _s(f"Phone: {row['phone']}"), ln=1)
+        pdf.cell(0, 6, _s(f"Created At: {row['created_at']}"), ln=1)
 
-        # Draw front and back thumbnails side-by-side on the right
-        right_block_w = 8*cm
-        img_x_front = width - margin - right_block_w
-        img_x_back  = width - margin - right_block_w/2  # appears slightly right; we’ll stack instead for consistency
+        def add_image(label, path):
+            pdf.set_font("Helvetica", "I", 10)
+            pdf.cell(0, 5, _s(label), ln=1)
+            if path and os.path.exists(path):
+                try:
+                    pdf.image(path, w=90)
+                    pdf.ln(3)
+                except:
+                    pdf.cell(0, 5, _s("(Error loading image)"), ln=1)
 
-        # Safer: stack vertically (front then back) on the right
-        y_img_top = y
-        y_after_front = _draw_thumbnail(c, row.get("image_front_path"), width - margin - right_block_w, y_img_top, max_w_cm=8, max_h_cm=4.5)
-        y_after_back  = _draw_thumbnail(c, row.get("image_back_path"),  width - margin - right_block_w, y_after_front, max_w_cm=8, max_h_cm=4.5)
-        # Ensure y doesn’t jump up if images are short
-        y = min(y_after_back, y - 8)
+        add_image("Front:", row["image_front_path"])
+        add_image("Back:", row["image_back_path"])
 
-        c.line(margin, y, width - margin, y)
-        y -= 18
+        pdf.ln(3)
+        pdf.set_draw_color(180, 180, 180)
+        y = pdf.get_y()
+        pdf.line(10, y, 200, y)
+        pdf.ln(4)
 
-    c.save()
-    buffer.seek(0)
-    return buffer.getvalue()
+    return pdf.output(dest="S").encode("latin-1")
+
 
 def pdf_single_record(row: pd.Series) -> bytes:
-    buffer = BytesIO()
-    c = canvas.Canvas(buffer, pagesize=A4)
-    width, height = A4
-    margin = 2*cm
-    y = height - margin
+    pdf = FPDF("P", "mm", "A4")
+    pdf.set_auto_page_break(True, margin=15)
+    pdf.add_page()
 
-    c.setTitle(f"Employee - {row['employee_name']}")
+    pdf.set_font("Helvetica", "B", 16)
+    pdf.cell(0, 10, _s("Employee Profile"), ln=1)
 
-    c.setFont("Helvetica-Bold", 16)
-    c.drawString(margin, y, "Employee Profile")
-    y -= 20
-    c.setFont("Helvetica", 12)
-    c.drawString(margin, y, f"Name: {row['employee_name']}")
-    y -= 16
-    c.drawString(margin, y, f"Citizenship No: {row['citizenship_no']}")
-    y -= 16
-    y = _draw_wrapped_text(c, f"Address: {row['address']}", margin, y, max_width=width - 2*margin)
-    c.drawString(margin, y, f"Phone: {row['phone']}")
-    y -= 16
-    c.drawString(margin, y, f"Created At: {row['created_at']}")
-    y -= 20
+    pdf.set_font("Helvetica", "", 12)
+    pdf.cell(0, 8, _s(f"Name: {row['employee_name']}"), ln=1)
+    pdf.cell(0, 8, _s(f"Citizenship No: {row['citizenship_no']}"), ln=1)
+    pdf.multi_cell(0, 7, _s(f"Address: {row['address']}"))
+    pdf.cell(0, 8, _s(f"Phone: {row['phone']}"), ln=1)
+    pdf.cell(0, 8, _s(f"Created At: {row['created_at']}"), ln=1)
+    pdf.ln(3)
 
-    # Images (Front then Back)
-    c.setFont("Helvetica-Bold", 12)
-    c.drawString(margin, y, "Front")
-    y -= 14
-    y = _draw_thumbnail(c, row.get("image_front_path"), margin, y, max_w_cm=16, max_h_cm=9)
+    def add_large_image(label, path):
+        pdf.set_font("Helvetica", "B", 11)
+        pdf.cell(0, 7, _s(label), ln=1)
+        if path and os.path.exists(path):
+            try:
+                pdf.image(path, w=160)
+                pdf.ln(5)
+            except:
+                pdf.cell(0, 5, _s("(Image error)"), ln=1)
+        else:
+            pdf.cell(0, 5, _s("(No image found)"), ln=1)
 
-    c.setFont("Helvetica-Bold", 12)
-    c.drawString(margin, y, "Back")
-    y -= 14
-    y = _draw_thumbnail(c, row.get("image_back_path"), margin, y, max_w_cm=16, max_h_cm=9)
+    add_large_image("Front:", row["image_front_path"])
+    add_large_image("Back:", row["image_back_path"])
 
-    c.save()
-    buffer.seek(0)
-    return buffer.getvalue()
+    return pdf.output(dest="S").encode("latin-1")
 
-# --------------------------
-# Initialize
-# --------------------------
+
+# --------------------------------------------------
+# START APP
+# --------------------------------------------------
 init_db()
+
 if "auth" not in st.session_state:
     st.session_state.auth = {"is_authenticated": False, "user": None}
 
-# --------------------------
-# Styles
-# --------------------------
+
+# --------------------------------------------------
+# STYLES
+# --------------------------------------------------
 st.markdown("""
-    <style>
-    .main { background: #f5f9ff; }
-    .title {
-        font-size: 38px; color: #0b5ed7; text-align: center; font-weight: 800;
-        margin-bottom: 0.5rem;
-    }
-    .subtitle { text-align: center; color: #5d6c83; margin-bottom: 1.5rem; }
-    .card {
-        background: #ffffff; padding: 24px; border-radius: 16px;
-        box-shadow: 0 8px 24px rgba(0,0,0,0.08); border: 1px solid #eaf0fb;
-    }
-    .muted { color: #6b7a90; font-size: 0.9rem; }
-    </style>
+<style>
+.main { background:#f5f9ff; }
+.card {
+    background:white; padding:20px; border-radius:12px;
+    box-shadow: 0 4px 14px rgba(0,0,0,0.1);
+}
+.title { text-align:center; font-size:40px; color:#0b5ed7; font-weight:800; }
+.subtitle { text-align:center; color:#5d6c83; margin-bottom:1rem; }
+</style>
 """, unsafe_allow_html=True)
 
-# --------------------------
-# Header
-# --------------------------
-st.markdown("<h1 class='title'>🛡️ Secured Employee Registration</h1>", unsafe_allow_html=True)
-st.markdown("<div class='subtitle'>Authorized access only • Store + Browse + Export (CSV/PDF)</div>", unsafe_allow_html=True)
 
-# --------------------------
-# Sidebar (Auth info)
-# --------------------------
+# --------------------------------------------------
+# HEADER
+# --------------------------------------------------
+st.markdown("<h1 class='title'>🛡️ Secured Employee Registration</h1>", unsafe_allow_html=True)
+st.markdown("<div class='subtitle'>Authorized access only • Store • Browse • Export (CSV/PDF)</div>", unsafe_allow_html=True)
+
+
+# --------------------------------------------------
+# SIDEBAR LOGIN
+# --------------------------------------------------
 with st.sidebar:
     st.header("🔐 Authentication")
+
     if st.session_state.auth["is_authenticated"]:
         user = st.session_state.auth["user"]
-        st.success(f"Signed in as **{user['full_name']}** ({user['username']})")
+        st.success(f"Logged in as **{user['full_name']}** ({user['username']})")
+
         if st.button("Logout"):
             st.session_state.auth = {"is_authenticated": False, "user": None}
             st.rerun()
+
     else:
-        st.info("Please login to continue.")
-        login_user = st.text_input("Username", key="login_username")
-        login_pass = st.text_input("Password", type="password", key="login_password")
+        username = st.text_input("Username")
+        password = st.text_input("Password", type="password")
+
         if st.button("Login"):
-            ok, user = authenticate(login_user.strip(), login_pass)
+            ok, user = authenticate(username.strip(), password)
             if ok:
                 st.session_state.auth = {"is_authenticated": True, "user": user}
                 st.rerun()
             else:
-                st.error("Invalid username or password.")
+                st.error("Invalid credentials")
 
-# --------------------------
-# Main Body
-# --------------------------
+
+# --------------------------------------------------
+# AUTH CHECK
+# --------------------------------------------------
 if not st.session_state.auth["is_authenticated"]:
-    st.warning("Only authorized users can access the registration form and data.")
+    st.warning("Login required to access the system.")
     st.stop()
 
-# ---------- Registration Form ----------
-st.markdown("### 📝 Register Employee")
-with st.container():
-    col_form, col_preview = st.columns([2, 1], gap="large")
 
-    with col_form:
+# --------------------------------------------------
+# REGISTRATION FORM
+# --------------------------------------------------
+st.markdown("## 📝 Register Employee")
+with st.container():
+    col1, col2 = st.columns([2, 1])
+
+    with col1:
         st.markdown("<div class='card'>", unsafe_allow_html=True)
+
         citizenship_no = st.text_input("🪪 Citizenship Number *")
         employee_name = st.text_input("👤 Employee Name *")
-        address = st.text_area("📍 Address *", height=100, help="Enter full address including city and state.")
-        phone = st.text_input("📞 Phone Number *", placeholder="+91-XXXXXXXXXX")
+        address = st.text_area("📍 Address *")
+        phone = st.text_input("📞 Phone Number *")
 
-        col_u1, col_u2 = st.columns(2)
-        with col_u1:
-            citizenship_image_front = st.file_uploader("🖼 Front Image *", type=["jpg", "jpeg", "png"], key="front")
-        with col_u2:
-            citizenship_image_back = st.file_uploader("🖼 Back Image *", type=["jpg", "jpeg", "png"], key="back")
+        fc, bc = st.columns(2)
+        with fc:
+            front_img = st.file_uploader("Front Image *", type=["jpg", "jpeg", "png"])
+        with bc:
+            back_img = st.file_uploader("Back Image *", type=["jpg", "jpeg", "png"])
 
-        save_btn = st.button("💾 Save Record", use_container_width=True)
-
-        if save_btn:
-            if not (citizenship_no and employee_name and address and phone and citizenship_image_front and citizenship_image_back):
-                st.error("Please fill all required fields (*) and upload both images (front & back).")
+        if st.button("💾 Save Record"):
+            if not all([citizenship_no, employee_name, address, phone, front_img, back_img]):
+                st.error("All fields including front & back images are required.")
             else:
-                # Basic phone sanity check
-                if len(phone) < 6 or len(phone) > 20:
-                    st.warning("Please provide a valid phone number (6–20 characters).")
-                front_path, back_path = save_employee(
+                f, b = save_employee(
                     citizenship_no.strip(), employee_name.strip(), address.strip(), phone.strip(),
-                    citizenship_image_front, citizenship_image_back
+                    front_img, back_img
                 )
-                st.success("✅ Record saved successfully!")
-                st.caption(f"Front image: `{front_path}`")
-                st.caption(f"Back image: `{back_path}`")
+                st.success("Record saved successfully.")
+                st.caption(f"Front saved: {f}")
+                st.caption(f"Back saved: {b}")
 
         st.markdown("</div>", unsafe_allow_html=True)
 
-    with col_preview:
+    with col2:
         st.markdown("<div class='card'>", unsafe_allow_html=True)
-        st.markdown("#### 👁️ Preview")
-        if citizenship_image_front or citizenship_image_back:
-            tabs = st.tabs(["Front", "Back"])
-            with tabs[0]:
-                if citizenship_image_front:
-                    st.image(citizenship_image_front, caption="Citizenship Card (Front)", use_container_width=True)
-                else:
-                    st.info("Upload front image to preview.")
-            with tabs[1]:
-                if citizenship_image_back:
-                    st.image(citizenship_image_back, caption="Citizenship Card (Back)", use_container_width=True)
-                else:
-                    st.info("Upload back image to preview.")
-        else:
-            st.info("Upload images to see preview.")
+        st.subheader("Preview")
+        if front_img:
+            st.image(front_img, caption="Front")
+        if back_img:
+            st.image(back_img, caption="Back")
         st.markdown("</div>", unsafe_allow_html=True)
 
-# ---------- Records + Export ----------
-st.markdown("### 📚 Saved Records")
+
+# --------------------------------------------------
+# RECORDS TABLE
+# --------------------------------------------------
+st.markdown("## 📚 Saved Records")
+
 df = fetch_employees()
+if df.empty:
+    st.info("No records found.")
+else:
+    q = st.text_input("🔎 Search by name / citizenship / phone")
+    df_view = df.copy()
 
-with st.container():
-    st.markdown("<div class='card'>", unsafe_allow_html=True)
-    if df.empty:
-        st.info("No records found yet.")
-    else:
-        # Search/filter
-        filt_col1, filt_col2, filt_col3 = st.columns([2, 1, 1])
-        with filt_col1:
-            q = st.text_input("🔎 Search by name / citizenship no / phone", placeholder="Type to filter...")
-        with filt_col2:
-            show_images = st.checkbox("Show front images", value=True)
-        with filt_col3:
-            show_back_images = st.checkbox("Show back images", value=False)
+    if q:
+        q_low = q.lower()
+        df_view = df_view[
+            df_view["employee_name"].str.lower().str.contains(q_low) |
+            df_view["citizenship_no"].str.lower().str.contains(q_low) |
+            df_view["phone"].str.lower().str.contains(q_low)
+        ]
 
-        df_view = df.copy()
-        if q:
-            q_low = q.lower()
-            df_view = df_view[
-                df_view["employee_name"].str.lower().str.contains(q_low, na=False) |
-                df_view["citizenship_no"].str.lower().str.contains(q_low, na=False) |
-                df_view["phone"].str.lower().str.contains(q_low, na=False)
-            ]
+    st.dataframe(df_view[["citizenship_no", "employee_name", "address", "phone", "created_at"]],
+                 use_container_width=True, height=300)
 
-        st.dataframe(
-            df_view[["citizenship_no", "employee_name", "address", "phone", "created_at"]],
-            use_container_width=True,
-            height=300
+    st.markdown("### 🖼 Image Gallery")
+    show_front = st.checkbox("Show Front Images", True)
+    show_back = st.checkbox("Show Back Images", False)
+
+    if show_front:
+        st.write("#### Front Images")
+        cols = st.columns(3)
+        i = 0
+        for _, r in df_view.iterrows():
+            if r["image_front_path"] and os.path.exists(r["image_front_path"]):
+                with cols[i % 3]:
+                    st.image(r["image_front_path"],
+                             caption=f"{r['employee_name']} ({r['citizenship_no']}) - Front",
+                             use_container_width=True)
+                i += 1
+
+    if show_back:
+        st.write("#### Back Images")
+        cols = st.columns(3)
+        i = 0
+        for _, r in df_view.iterrows():
+            if r["image_back_path"] and os.path.exists(r["image_back_path"]):
+                with cols[i % 3]:
+                    st.image(r["image_back_path"],
+                             caption=f"{r['employee_name']} ({r['citizenship_no']}) - Back",
+                             use_container_width=True)
+                i += 1
+
+    st.markdown("---")
+
+    colA, colB, colC = st.columns([1, 1, 2])
+
+    # CSV EXPORT
+    with colA:
+        st.download_button(
+            "⬇️ Download CSV (filtered)",
+            data=to_csv_bytes(df_view),
+            file_name="employees_filtered.csv",
+            mime="text/csv",
+            use_container_width=True
         )
 
-        # Inline galleries
-        if show_images:
-            st.markdown("#### 🖼️ Front Image Previews")
-            grid_cols = st.columns(3)
-            idx = 0
-            for _, r in df_view.iterrows():
-                try:
-                    p = r.get("image_front_path")
-                    if p and os.path.exists(p):
-                        with grid_cols[idx % 3]:
-                            st.image(p, caption=f"{r['employee_name']} ({r['citizenship_no']}) — Front", use_container_width=True)
-                            st.caption(r["created_at"])
-                        idx += 1
-                except Exception:
-                    pass
+    # PDF EXPORT (ALL)
+    with colB:
+        st.download_button(
+            "⬇️ Download PDF (filtered)",
+            data=pdf_all_records(df_view),
+            file_name="employees_filtered.pdf",
+            mime="application/pdf",
+            use_container_width=True
+        )
 
-        if show_back_images:
-            st.markdown("#### 🖼️ Back Image Previews")
-            grid_cols = st.columns(3)
-            idx = 0
-            for _, r in df_view.iterrows():
-                try:
-                    p = r.get("image_back_path")
-                    if p and os.path.exists(p):
-                        with grid_cols[idx % 3]:
-                            st.image(p, caption=f"{r['employee_name']} ({r['citizenship_no']}) — Back", use_container_width=True)
-                            st.caption(r["created_at"])
-                        idx += 1
-                except Exception:
-                    pass
-
-        st.markdown("---")
-        exp_cols = st.columns([1, 1, 2])
-        with exp_cols[0]:
-            # CSV download (all/filtered)
-            csv_bytes = to_csv_bytes(df_view)
+    # PDF SINGLE RECORD
+    with colC:
+        choices = df_view.apply(lambda r: f"{r['employee_name']} — {r['citizenship_no']}", axis=1).tolist()
+        sel = st.selectbox("Choose record for single PDF", choices)
+        if st.button("⬇️ Download Selected as PDF"):
+            row = df_view.iloc[choices.index(sel)]
+            pdf_data = pdf_single_record(row)
             st.download_button(
-                "⬇️ Download CSV (filtered)",
-                data=csv_bytes,
-                file_name="employees_filtered.csv",
-                mime="text/csv",
-                use_container_width=True
+                label="Download PDF",
+                data=pdf_data,
+                file_name=f"employee_{row['citizenship_no']}.pdf",
+                mime="application/pdf"
             )
-        with exp_cols[1]:
-            # PDF - All (filtered)
-            pdf_bytes = pdf_all_records(df_view)
-            st.download_button(
-                "⬇️ Download PDF (filtered)",
-                data=pdf_bytes,
-                file_name="employees_filtered.pdf",
-                mime="application/pdf",
-                use_container_width=True
-            )
-        with exp_cols[2]:
-            # PDF - Single record
-            if not df_view.empty:
-                options = df_view.apply(lambda r: f"{r['employee_name']} — {r['citizenship_no']}", axis=1).tolist()
-                choice = st.selectbox("Select a record for PDF", options)
-                if st.button("⬇️ Download Selected as PDF", use_container_width=True):
-                    sel = df_view.iloc[options.index(choice)]
-                    single_pdf = pdf_single_record(sel)
-                    st.download_button(
-                        label="Click here to download",
-                        data=single_pdf,
-                        file_name=f"employee_{sel['citizenship_no']}.pdf",
-                        mime="application/pdf"
-                    )
-
-    st.markdown("</div>", unsafe_allow_html=True)
-
-# Footer
-
-st.markdown("<div class='muted'>Tip: change the default admin password and consider using st.secrets for salts and configurations.</div>", unsafe_allow_html=True)
 
 
+st.markdown("<br><div style='text-align:center;color:#999;'>Built by Sanjay</div>", unsafe_allow_html=True)
