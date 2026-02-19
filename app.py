@@ -19,6 +19,59 @@ PASSWORD_SALT = st.secrets.get("PASSWORD_SALT", "Sanjay#$55")
 st.set_page_config(page_title="Employee Registration (Secured)", page_icon="🛡️", layout="wide")
 
 
+
+
+
+# ============================
+# USER MANAGEMENT HELPERS
+# ============================
+
+def get_all_users():
+    conn = sqlite3.connect(DB_NAME)
+    cur = conn.cursor()
+    cur.execute("SELECT id, username, full_name, role FROM users ORDER BY username")
+    data = cur.fetchall()
+    conn.close()
+    return data
+
+def create_user(username, full_name, password, role):
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO users (username, full_name, password_hash, role)
+            VALUES (?, ?, ?, ?)
+        """, (username, full_name, hash_password(password), role))
+        conn.commit()
+        conn.close()
+        return True, "User created successfully"
+    except sqlite3.IntegrityError:
+        return False, "Username already exists!"
+    except Exception as e:
+        return False, str(e)
+
+def delete_user(user_id):
+    conn = sqlite3.connect(DB_NAME)
+    cur = conn.cursor()
+    cur.execute("DELETE FROM users WHERE id=?", (user_id,))
+    conn.commit()
+    conn.close()
+
+def reset_password(user_id, new_password):
+    conn = sqlite3.connect(DB_NAME)
+    cur = conn.cursor()
+    cur.execute("UPDATE users SET password_hash=? WHERE id=?", (hash_password(new_password), user_id))
+    conn.commit()
+    conn.close()
+
+def update_role(user_id, role):
+    conn = sqlite3.connect(DB_NAME)
+    cur = conn.cursor()
+    cur.execute("UPDATE users SET role=? WHERE id=?", (role, user_id))
+    conn.commit()
+    conn.close()
+
+
 # --------------------------------------------------
 # HELPERS
 # --------------------------------------------------
@@ -441,3 +494,4 @@ else:
 
 
 st.markdown("<br><div style='text-align:center;color:#999;'>Built by Sanjay</div>", unsafe_allow_html=True)
+
