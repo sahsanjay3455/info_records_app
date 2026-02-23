@@ -109,7 +109,6 @@ def _save_image(file, base_name: str) -> str:
     Save either an uploaded file (file_uploader) or a camera capture (camera_input).
     camera_input may not have a meaningful extension; default to .jpg in that case.
     """
-    # Try to read extension from uploaded file; fallback to .jpg
     original_name = getattr(file, "name", "") or ""
     ext = os.path.splitext(original_name)[1].lower()
     if ext not in [".jpg", ".jpeg", ".png"]:
@@ -173,6 +172,125 @@ def to_csv_bytes(df: pd.DataFrame) -> bytes:
 
 
 # --------------------------------------------------
+# PDF IMAGE LAYOUT HELPERS
+# --------------------------------------------------
+def _calc_scaled_size(img_path: str, max_w: float, max_h: float):
+    """Return scaled (w, h) to fit inside max box while keeping aspect ratio."""
+    try:
+        with Image.open(img_path) as im:
+            w, h = im.size
+    except Exception:
+        # If image can't be opened, return None to skip
+        return None
+
+    ratio = min(max_w / w, max_h / h)
+    return (w * ratio, h * ratio)
+
+
+def _add_images_side_by_side(pdf: FPDF, left_path: str, right_path: str, *,
+                             total_width: float = 180, gap: float = 6,
+                             max_height: float = 70, x_margin: float = 15):
+    """
+    Place two images (left & right) side-by-side on the current line.
+    - total_width: overall width available for both images + gap
+    - gap: spacing between images
+    - max_height: max height for either image
+    - x_margin: left margin to start drawing
+
+    Advances the Y cursor by the tallest drawn image + small padding.
+    If one image missing, centers the available one within total_width.
+    """
+    y = pdf.get_y()
+    x_start = x_margin
+    each_max_w = (total_width - gap) / 2.0
+
+    left_size = _calc_scaled_size(left_path, each_max_w, max_height) if (left_path and os.path.exists(left_path)) else None
+    right_size = _calc_scaled_size(right_path, each_max_w, max_height) if (right_path and os.path.exists(right_path)) else None
+
+    # If both missing, just show a note and return
+    if left_size is None and right_size is None:
+        pdf.set_font("Helvetica", "I", 10)
+        pdf.cell(0, 6, _s("(No images found)"), ln=1)
+        return
+
+    # If only one image, center it
+    if left_size is None and right_size is not None:
+        rw, rh = right_size
+        x_center = x_start + (total_width - rw) / 2.0
+        try:
+            pdf.image(right_path, x=x_center, y=y, w=rw, h=rh)
+        except Exception:
+            pdf.set_font("Helvetica", "I", 10)
+            pdf.cell(0, 6, _s("(Error loading right image)"), ln=1)
+            return
+        pdf.set_y(y + rh + 4)
+        return
+
+    if right_size is None and left_size is not None:
+        lw, lh = left_size
+        x_center = x_start + (total_width - lw) / 2.0
+        try:
+            pdf.image(left_path, x=x_center, y=y, w=lw, h=lh)
+        except Exception:
+            pdf.set_font("Helvetica", "I", 10)
+            pdf.cell(0, 6, _s("(Error loading left image)"), ln=1)
+            return
+        pdf.set_y(y + lh + 4)
+        return
+
+    # Both images exist
+    lw, lh = left_size
+    rw, rh = right_size
+
+    # Positions
+    x_left = x_start
+    x_right = x_start + each_max_w + gap
+
+    # Draw
+    left_err = False
+    right_err = False
+    try:
+        pdf.image(left_path, x=x_left, y=y, w=lw, h=lh)
+    except Exception:
+        left_err = True
+    try:
+        pdf.image(right_path, x=x_right, y=y, w=rw, h=rh)
+    except Exception:
+        right_err = True
+
+    if left_err and right_err:
+        pdf.set_font("Helvetica", "I", 10)
+        pdf.cell(0, 6, _s("(Error loading images)"), ln=1)
+        return
+    elif left_err:
+        # Center right if left failed
+        x_center = x_start + (total_width - rw) / 2.0
+        try:
+            pdf.image(right_path, x=x_center, y=y, w=rw, h=rh)
+        except Exception:
+            pdf.set_font("Helvetica", "I", 10)
+            pdf.cell(0, 6, _s("(Error loading right image)"), ln=1)
+            return
+        pdf.set_y(y + rh + 4)
+        return
+    elif right_err:
+        # Center left if right failed
+        x_center = x_start + (total_width - lw) / 2.0
+        try:
+            pdf.image(left_path, x=x_center, y=y, w=lw, h=lh)
+        except Exception:
+            pdf.set_font("Helvetica", "I", 10)
+            pdf.cell(0, 6, _s("(Error loading left image)"), ln=1)
+            return
+        pdf.set_y(y + lh + 4)
+        return
+
+    # Advance by tallest height
+    tallest = max(lh, rh)
+    pdf.set_y(y + tallest + 4)
+
+
+# --------------------------------------------------
 # FPDF PDF Builders
 # --------------------------------------------------
 def pdf_all_records(df: pd.DataFrame) -> bytes:
@@ -197,22 +315,33 @@ def pdf_all_records(df: pd.DataFrame) -> bytes:
         pdf.cell(0, 6, _s(f"Phone: {row['phone']}"), ln=1)
         pdf.cell(0, 6, _s(f"Created At: {row['created_at']}"), ln=1)
 
-        def add_image(label, path):
-            pdf.set_font("Helvetica", "I", 10)
-            pdf.cell(0, 5, _s(label), ln=1)
-            if path and os.path.exists(path):
-                try:
-                    pdf.image(path, w=90)
-                    pdf.ln(3)
-                except Exception:
-                    pdf.cell(0, 5, _s("(Error loading image)"), ln=1)
-            else:
-                pdf.cell(0, 5, _s("(No image found)"), ln=1)
+        # Labels for side-by-side images
+        pdf.ln(1)
+        pdf.set_font("Helvetica", "I", 10)
+        # Place labels above each image column
+        x_current = pdf.get_x()
+        y_current = pdf.get_y()
+        left_label_x = 15
+        right_label_x = 15 + (180 - 6) / 2 + 6  # x_margin + each_max_w + gap
 
-        add_image("Front:", row["image_front_path"])
-        add_image("Back:", row["image_back_path"])
+        pdf.set_xy(left_label_x, y_current)
+        pdf.cell(0, 5, _s("Front"), ln=0)
+        pdf.set_xy(right_label_x, y_current)
+        pdf.cell(0, 5, _s("Back"), ln=1)
 
-        pdf.ln(3)
+        # Place images side-by-side
+        _add_images_side_by_side(
+            pdf,
+            row.get("image_front_path"),
+            row.get("image_back_path"),
+            total_width=180,
+            gap=6,
+            max_height=70,
+            x_margin=15,
+        )
+
+        # Divider
+        pdf.ln(2)
         pdf.set_draw_color(180, 180, 180)
         y = pdf.get_y()
         pdf.line(10, y, 200, y)
@@ -235,22 +364,28 @@ def pdf_single_record(row: pd.Series) -> bytes:
     pdf.multi_cell(0, 7, _s(f"Address: {row['address']}"))
     pdf.cell(0, 8, _s(f"Phone: {row['phone']}"), ln=1)
     pdf.cell(0, 8, _s(f"Created At: {row['created_at']}"), ln=1)
-    pdf.ln(3)
+    pdf.ln(2)
 
-    def add_large_image(label, path):
-        pdf.set_font("Helvetica", "B", 11)
-        pdf.cell(0, 7, _s(label), ln=1)
-        if path and os.path.exists(path):
-            try:
-                pdf.image(path, w=160)
-                pdf.ln(5)
-            except Exception:
-                pdf.cell(0, 5, _s("(Image error)"), ln=1)
-        else:
-            pdf.cell(0, 5, _s("(No image found)"), ln=1)
+    # Labels for side-by-side images
+    pdf.set_font("Helvetica", "B", 11)
+    y_current = pdf.get_y()
+    left_label_x = 15
+    right_label_x = 15 + (180 - 6) / 2 + 6  # x_margin + each_max_w + gap
+    pdf.set_xy(left_label_x, y_current)
+    pdf.cell(0, 7, _s("Front"), ln=0)
+    pdf.set_xy(right_label_x, y_current)
+    pdf.cell(0, 7, _s("Back"), ln=1)
 
-    add_large_image("Front:", row["image_front_path"])
-    add_large_image("Back:", row["image_back_path"])
+    # Images side-by-side, larger height for single profile
+    _add_images_side_by_side(
+        pdf,
+        row.get("image_front_path"),
+        row.get("image_back_path"),
+        total_width=180,
+        gap=6,
+        max_height=110,   # larger preview for single record
+        x_margin=15,
+    )
 
     return pdf.output(dest="S").encode("latin-1")
 
