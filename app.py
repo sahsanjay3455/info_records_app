@@ -19,59 +19,6 @@ PASSWORD_SALT = st.secrets.get("PASSWORD_SALT", "Sanjay#$55")
 st.set_page_config(page_title="Employee Registration (Secured)", page_icon="🛡️", layout="wide")
 
 
-
-
-
-# ============================
-# USER MANAGEMENT HELPERS
-# ============================
-
-def get_all_users():
-    conn = sqlite3.connect(DB_NAME)
-    cur = conn.cursor()
-    cur.execute("SELECT id, username, full_name, role FROM users ORDER BY username")
-    data = cur.fetchall()
-    conn.close()
-    return data
-
-def create_user(username, full_name, password, role):
-    try:
-        conn = sqlite3.connect(DB_NAME)
-        cur = conn.cursor()
-        cur.execute("""
-            INSERT INTO users (username, full_name, password_hash, role)
-            VALUES (?, ?, ?, ?)
-        """, (username, full_name, hash_password(password), role))
-        conn.commit()
-        conn.close()
-        return True, "User created successfully"
-    except sqlite3.IntegrityError:
-        return False, "Username already exists!"
-    except Exception as e:
-        return False, str(e)
-
-def delete_user(user_id):
-    conn = sqlite3.connect(DB_NAME)
-    cur = conn.cursor()
-    cur.execute("DELETE FROM users WHERE id=?", (user_id,))
-    conn.commit()
-    conn.close()
-
-def reset_password(user_id, new_password):
-    conn = sqlite3.connect(DB_NAME)
-    cur = conn.cursor()
-    cur.execute("UPDATE users SET password_hash=? WHERE id=?", (hash_password(new_password), user_id))
-    conn.commit()
-    conn.close()
-
-def update_role(user_id, role):
-    conn = sqlite3.connect(DB_NAME)
-    cur = conn.cursor()
-    cur.execute("UPDATE users SET role=? WHERE id=?", (role, user_id))
-    conn.commit()
-    conn.close()
-
-
 # --------------------------------------------------
 # HELPERS
 # --------------------------------------------------
@@ -158,12 +105,27 @@ def authenticate(username: str, password: str):
 
 
 def _save_image(file, base_name: str) -> str:
-    ext = os.path.splitext(file.name)[1].lower()
+    """
+    Save either an uploaded file (file_uploader) or a camera capture (camera_input).
+    camera_input may not have a meaningful extension; default to .jpg in that case.
+    """
+    # Try to read extension from uploaded file; fallback to .jpg
+    original_name = getattr(file, "name", "") or ""
+    ext = os.path.splitext(original_name)[1].lower()
+    if ext not in [".jpg", ".jpeg", ".png"]:
+        ext = ".jpg"
+
     safe_name = base_name.replace(" ", "_").replace("/", "_")
     path = os.path.join(IMAGE_DIR, f"{safe_name}{ext}")
 
+    # Prefer getbuffer() for uploader, fallback to getvalue() for camera
+    try:
+        data = file.getbuffer()
+    except Exception:
+        data = file.getvalue()
+
     with open(path, "wb") as f:
-        f.write(file.getbuffer())
+        f.write(data)
 
     return path
 
@@ -180,7 +142,7 @@ def save_employee(cit, name, addr, phone, front_img, back_img):
         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         cit, name, addr, phone,
-        front_path,
+        front_path,   # legacy image_path retained and set to front for compatibility
         front_path,
         back_path,
         datetime.now().isoformat(timespec="seconds")
@@ -242,8 +204,10 @@ def pdf_all_records(df: pd.DataFrame) -> bytes:
                 try:
                     pdf.image(path, w=90)
                     pdf.ln(3)
-                except:
+                except Exception:
                     pdf.cell(0, 5, _s("(Error loading image)"), ln=1)
+            else:
+                pdf.cell(0, 5, _s("(No image found)"), ln=1)
 
         add_image("Front:", row["image_front_path"])
         add_image("Back:", row["image_back_path"])
@@ -280,7 +244,7 @@ def pdf_single_record(row: pd.Series) -> bytes:
             try:
                 pdf.image(path, w=160)
                 pdf.ln(5)
-            except:
+            except Exception:
                 pdf.cell(0, 5, _s("(Image error)"), ln=1)
         else:
             pdf.cell(0, 5, _s("(No image found)"), ln=1)
@@ -373,11 +337,38 @@ with st.container():
         address = st.text_area("📍 Address *")
         phone = st.text_input("📞 Phone Number *")
 
+        # --- Image capture OR upload (Front / Back) ---
         fc, bc = st.columns(2)
+
         with fc:
-            front_img = st.file_uploader("Front Image *", type=["jpg", "jpeg", "png"])
+            st.markdown("**Front Image Source**")
+            front_source = st.radio(
+                "Source (Front)",
+                ["Upload", "Camera"],
+                index=0,
+                horizontal=True,
+                label_visibility="collapsed",
+                key="front_source"
+            )
+            if front_source == "Upload":
+                front_img = st.file_uploader("Front Image *", type=["jpg", "jpeg", "png"], key="front_upload")
+            else:
+                front_img = st.camera_input("Capture Front *", key="front_camera")
+
         with bc:
-            back_img = st.file_uploader("Back Image *", type=["jpg", "jpeg", "png"])
+            st.markdown("**Back Image Source**")
+            back_source = st.radio(
+                "Source (Back)",
+                ["Upload", "Camera"],
+                index=0,
+                horizontal=True,
+                label_visibility="collapsed",
+                key="back_source"
+            )
+            if back_source == "Upload":
+                back_img = st.file_uploader("Back Image *", type=["jpg", "jpeg", "png"], key="back_upload")
+            else:
+                back_img = st.camera_input("Capture Back *", key="back_camera")
 
         if st.button("💾 Save Record"):
             if not all([citizenship_no, employee_name, address, phone, front_img, back_img]):
@@ -396,9 +387,9 @@ with st.container():
     with col2:
         st.markdown("<div class='card'>", unsafe_allow_html=True)
         st.subheader("Preview")
-        if front_img:
+        if 'front_img' in locals() and front_img:
             st.image(front_img, caption="Front")
-        if back_img:
+        if 'back_img' in locals() and back_img:
             st.image(back_img, caption="Back")
         st.markdown("</div>", unsafe_allow_html=True)
 
@@ -423,8 +414,11 @@ else:
             df_view["phone"].str.lower().str.contains(q_low)
         ]
 
-    st.dataframe(df_view[["citizenship_no", "employee_name", "address", "phone", "created_at"]],
-                 use_container_width=True, height=300)
+    st.dataframe(
+        df_view[["citizenship_no", "employee_name", "address", "phone", "created_at"]],
+        use_container_width=True,
+        height=300
+    )
 
     st.markdown("### 🖼 Image Gallery")
     show_front = st.checkbox("Show Front Images", True)
@@ -437,9 +431,11 @@ else:
         for _, r in df_view.iterrows():
             if r["image_front_path"] and os.path.exists(r["image_front_path"]):
                 with cols[i % 3]:
-                    st.image(r["image_front_path"],
-                             caption=f"{r['employee_name']} ({r['citizenship_no']}) - Front",
-                             use_container_width=True)
+                    st.image(
+                        r["image_front_path"],
+                        caption=f"{r['employee_name']} ({r['citizenship_no']}) - Front",
+                        use_container_width=True
+                    )
                 i += 1
 
     if show_back:
@@ -449,9 +445,11 @@ else:
         for _, r in df_view.iterrows():
             if r["image_back_path"] and os.path.exists(r["image_back_path"]):
                 with cols[i % 3]:
-                    st.image(r["image_back_path"],
-                             caption=f"{r['employee_name']} ({r['citizenship_no']}) - Back",
-                             use_container_width=True)
+                    st.image(
+                        r["image_back_path"],
+                        caption=f"{r['employee_name']} ({r['citizenship_no']}) - Back",
+                        use_container_width=True
+                    )
                 i += 1
 
     st.markdown("---")
@@ -492,6 +490,4 @@ else:
                 mime="application/pdf"
             )
 
-
 st.markdown("<br><div style='text-align:center;color:#999;'>Built by Sanjay</div>", unsafe_allow_html=True)
-
