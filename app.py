@@ -7,7 +7,7 @@ from io import BytesIO
 from PIL import Image
 import pandas as pd
 from fpdf import FPDF
-
+import shutil  # --- NEW ---
 
 # --------------------------------------------------
 # CONFIG
@@ -169,6 +169,151 @@ def fetch_employees():
 
 def to_csv_bytes(df: pd.DataFrame) -> bytes:
     return df.drop(columns=["id"]).to_csv(index=False).encode("utf-8")
+
+
+# --------------------------------------------------
+# --- NEW: Utilities for UPDATE/DELETE
+# --------------------------------------------------
+def _safe_unlink(path: str):
+    """Remove file if exists."""
+    if path and isinstance(path, str) and os.path.exists(path):
+        try:
+            os.remove(path)
+        except Exception:
+            pass
+
+
+def _rename_if_exists(old_path: str, new_base: str) -> str:
+    """
+    Renames the existing file to use the new_base keeping extension.
+    Returns the new path if successful, otherwise returns the old_path.
+    """
+    if not old_path or not os.path.exists(old_path):
+        return old_path
+    ext = os.path.splitext(old_path)[1].lower() or ".jpg"
+    safe_new = new_base.replace(" ", "_").replace("/", "_")
+    new_path = os.path.join(IMAGE_DIR, f"{safe_new}{ext}")
+    # If target exists and is identical, keep it. Otherwise, rename (overwrite if necessary).
+    try:
+        if os.path.abspath(old_path) != os.path.abspath(new_path):
+            # Ensure target directory exists
+            os.makedirs(os.path.dirname(new_path), exist_ok=True)
+            # If a file already exists at new_path, remove it to avoid error.
+            if os.path.exists(new_path):
+                os.remove(new_path)
+            os.rename(old_path, new_path)
+        return new_path
+    except Exception:
+        return old_path
+
+
+def delete_employee(emp_id: int) -> bool:
+    """Delete a single employee + image files."""
+    conn = sqlite3.connect(DB_NAME)
+    cur = conn.cursor()
+    cur.execute("SELECT image_front_path, image_back_path FROM employees WHERE id=?", (emp_id,))
+    row = cur.fetchone()
+    if not row:
+        conn.close()
+        return False
+
+    front_path, back_path = row
+    _safe_unlink(front_path)
+    _safe_unlink(back_path)
+
+    cur.execute("DELETE FROM employees WHERE id=?", (emp_id,))
+    conn.commit()
+    conn.close()
+    return True
+
+
+def delete_all_employees() -> int:
+    """Delete all employees + all image files. Returns count deleted."""
+    conn = sqlite3.connect(DB_NAME)
+    cur = conn.cursor()
+    cur.execute("SELECT image_front_path, image_back_path FROM employees")
+    rows = cur.fetchall()
+    for front_path, back_path in rows:
+        _safe_unlink(front_path)
+        _safe_unlink(back_path)
+
+    cur.execute("SELECT COUNT(*) FROM employees")
+    count = cur.fetchone()[0]
+    cur.execute("DELETE FROM employees")
+    conn.commit()
+    conn.close()
+    return count
+
+
+def update_employee(
+    emp_id: int,
+    new_cit: str,
+    new_name: str,
+    new_addr: str,
+    new_phone: str,
+    front_img=None,
+    back_img=None
+) -> bool:
+    """
+    Update employee record. If new images are provided, save them.
+    If citizenship number changes and images are NOT replaced, rename existing files to match new base.
+    """
+    conn = sqlite3.connect(DB_NAME)
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT citizenship_no, image_front_path, image_back_path
+        FROM employees WHERE id=?
+    """, (emp_id,))
+    row = cur.fetchone()
+    if not row:
+        conn.close()
+        return False
+
+    old_cit, old_front_path, old_back_path = row
+
+    # Determine final image paths
+    final_front_path = old_front_path
+    final_back_path = old_back_path
+
+    # If new images provided -> overwrite with new saves using new CIT base
+    if front_img is not None:
+        final_front_path = _save_image(front_img, f"{new_cit}_front")
+        # Clean old if different
+        if old_front_path and final_front_path != old_front_path:
+            _safe_unlink(old_front_path)
+
+    if back_img is not None:
+        final_back_path = _save_image(back_img, f"{new_cit}_back")
+        if old_back_path and final_back_path != old_back_path:
+            _safe_unlink(old_back_path)
+
+    # If citizenship number changed and images NOT replaced, attempt rename for consistency
+    if new_cit and old_cit and new_cit != old_cit:
+        if front_img is None and old_front_path:
+            final_front_path = _rename_if_exists(old_front_path, f"{new_cit}_front")
+        if back_img is None and old_back_path:
+            final_back_path = _rename_if_exists(old_back_path, f"{new_cit}_back")
+
+    # Perform the update (respecting unique constraint on citizenship_no)
+    try:
+        cur.execute("""
+            UPDATE employees
+            SET citizenship_no=?, employee_name=?, address=?, phone=?,
+                image_path=?, image_front_path=?, image_back_path=?
+            WHERE id=?
+        """, (
+            new_cit.strip(), new_name.strip(), new_addr.strip(), new_phone.strip(),
+            final_front_path, final_front_path, final_back_path,
+            emp_id
+        ))
+        conn.commit()
+        ok = (cur.rowcount == 1)
+    except sqlite3.IntegrityError:
+        # likely duplicate citizenship number
+        ok = False
+
+    conn.close()
+    return ok
 
 
 # --------------------------------------------------
@@ -456,6 +601,9 @@ if not st.session_state.auth["is_authenticated"]:
     st.warning("Login required to access the system.")
     st.stop()
 
+user = st.session_state.auth["user"]
+is_admin = (user.get("role") == "admin")  # --- NEW ---
+
 
 # --------------------------------------------------
 # REGISTRATION FORM
@@ -624,5 +772,110 @@ else:
                 file_name=f"employee_{row['citizenship_no']}.pdf",
                 mime="application/pdf"
             )
+
+    # --------------------------------------------------
+    # --- NEW: Edit / Delete a specific record
+    # --------------------------------------------------
+    st.markdown("## ✏️ Edit / 🗑️ Delete Record")
+    st.markdown("<div class='card'>", unsafe_allow_html=True)
+
+    if not df_view.empty:
+        rec_labels = df_view.apply(lambda r: f"{r['employee_name']} — {r['citizenship_no']} — id:{r['id']}", axis=1).tolist()
+        rec_sel = st.selectbox("Select a record to edit/delete", rec_labels, key="edit_select")
+
+        # Resolve selected row
+        sel_idx = rec_labels.index(rec_sel)
+        sel_row = df_view.iloc[sel_idx]
+        sel_id = int(sel_row["id"])
+
+        with st.form(key=f"edit_form_{sel_id}", clear_on_submit=False):
+            st.write("### Edit fields")
+            new_cit = st.text_input("🪪 Citizenship Number", value=str(sel_row["citizenship_no"]), key=f"edit_cit_{sel_id}")
+            new_name = st.text_input("👤 Employee Name", value=str(sel_row["employee_name"]), key=f"edit_name_{sel_id}")
+            new_addr = st.text_area("📍 Address", value=str(sel_row["address"]), key=f"edit_addr_{sel_id}")
+            new_phone = st.text_input("📞 Phone Number", value=str(sel_row["phone"]), key=f"edit_phone_{sel_id}")
+
+            st.write("### Replace images (optional)")
+
+            c1, c2 = st.columns(2)
+            with c1:
+                front_src = st.radio("Front Image Source", ["Keep existing", "Upload", "Camera"],
+                                     horizontal=True, key=f"edit_front_src_{sel_id}")
+                front_img_new = None
+                if front_src == "Upload":
+                    front_img_new = st.file_uploader("New Front", type=["jpg", "jpeg", "png"], key=f"edit_front_upload_{sel_id}")
+                elif front_src == "Camera":
+                    front_img_new = st.camera_input("Capture New Front", key=f"edit_front_cam_{sel_id}")
+
+            with c2:
+                back_src = st.radio("Back Image Source", ["Keep existing", "Upload", "Camera"],
+                                    horizontal=True, key=f"edit_back_src_{sel_id}")
+                back_img_new = None
+                if back_src == "Upload":
+                    back_img_new = st.file_uploader("New Back", type=["jpg", "jpeg", "png"], key=f"edit_back_upload_{sel_id}")
+                elif back_src == "Camera":
+                    back_img_new = st.camera_input("Capture New Back", key=f"edit_back_cam_{sel_id}")
+
+            colU, colD = st.columns([1, 1])
+            with colU:
+                update_btn = st.form_submit_button("✅ Update")
+            with colD:
+                delete_btn = st.form_submit_button("🗑️ Delete", help="Deletes this record and its images")
+
+            if update_btn:
+                # Validate required simple fields
+                if not all([new_cit.strip(), new_name.strip(), new_addr.strip(), new_phone.strip()]):
+                    st.error("Citizenship, Name, Address, and Phone are required.")
+                else:
+                    ok = update_employee(
+                        emp_id=sel_id,
+                        new_cit=new_cit.strip(),
+                        new_name=new_name.strip(),
+                        new_addr=new_addr.strip(),
+                        new_phone=new_phone.strip(),
+                        front_img=(front_img_new if front_src != "Keep existing" else None),
+                        back_img=(back_img_new if back_src != "Keep existing" else None),
+                    )
+                    if ok:
+                        st.success("Record updated ✅")
+                        st.rerun()
+                    else:
+                        st.error("Update failed. Possibly duplicate Citizenship Number.")
+
+            if delete_btn:
+                if not is_admin:
+                    st.error("Only admin can delete records.")
+                else:
+                    done = delete_employee(sel_id)
+                    if done:
+                        st.success("Record deleted 🗑️")
+                        st.rerun()
+                    else:
+                        st.error("Delete failed. Record not found.")
+
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    # --------------------------------------------------
+    # --- NEW: Delete ALL records (Admin-only)
+    # --------------------------------------------------
+    st.markdown("## ⚠️ Delete ALL Records (Admin)")
+    st.markdown("<div class='card'>", unsafe_allow_html=True)
+
+    if not is_admin:
+        st.info("Only admin can delete all records.")
+    else:
+        with st.form(key="delete_all_form"):
+            st.warning("This will permanently delete **all employees and their images**. Type `DELETE` to confirm.")
+            confirm_text = st.text_input("Type here to confirm", key="delete_all_confirm")
+            del_all_btn = st.form_submit_button("🔥 Delete ALL")
+            if del_all_btn:
+                if confirm_text.strip().upper() != "DELETE":
+                    st.error("Confirmation text mismatch. Type `DELETE` to proceed.")
+                else:
+                    count = delete_all_employees()
+                    st.success(f"Deleted {count} records and their images.")
+                    st.rerun()
+
+    st.markdown("</div>", unsafe_allow_html=True)
 
 st.markdown("<br><div style='text-align:center;color:#999;'>Built by Sanjay</div>", unsafe_allow_html=True)
