@@ -81,7 +81,7 @@ def init_db():
         cur.execute("""
             INSERT INTO users (username, full_name, password_hash, role)
             VALUES (?, ?, ?, ?)
-        """, ("admin", "Administrator", hash_password("sanjay#$55"), "sanjay"))
+        """, ("admin", "Administrator", hash_password("admin123"), "admin"))
 
     conn.commit()
     conn.close()
@@ -879,4 +879,5 @@ else:
     st.markdown("</div>", unsafe_allow_html=True)
 
 st.markdown("<br><div style='text-align:center;color:#999;'>Built by Sanjay</div>", unsafe_allow_html=True)
+
 
