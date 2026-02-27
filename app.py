@@ -879,5 +879,3 @@ else:
     st.markdown("</div>", unsafe_allow_html=True)
 
 st.markdown("<br><div style='text-align:center;color:#999;'>Built by Sanjay</div>", unsafe_allow_html=True)
-
-
